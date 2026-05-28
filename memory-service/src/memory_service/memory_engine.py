@@ -189,7 +189,7 @@ def apply_memories(
                 # Deactivate all active memories matching this slot+entity_key
                 rows = conn.execute(
                     "SELECT id FROM memories WHERE user_id=? AND slot=? AND entity_key=? AND active=1",
-                    (user_id, mem.slot, mem.entity_key.lower())
+                    (user_id, mem.slot, (mem.entity_key or "").lower())
                 ).fetchall()
                 for row in rows:
                     _deactivate(conn, row["id"], now)
