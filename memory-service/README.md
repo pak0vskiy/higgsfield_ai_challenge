@@ -144,4 +144,4 @@ pytest tests/test_recall.py -v
 
 Fixture conversations live in `fixtures/conversations/*.yaml`. The quality test ingests each fixture, runs named probes, and prints `recall_quality: N/M probes passed (score)`. A minimum of 0.50 is enforced as a hard gate. The current v1 baseline with the rules-only extractor is **6/11 (0.55)**.
 
-To run against the LLM extractor, set `DEEPSEEK_API_KEY` or `OPENAI_API_KEY` before running pytest. Without keys, the rules extractor runs automatically.
+To run against the LLM extractor, set `OPENROUTER_API_KEY` (or `OPENAI_API_KEY` for the fallback) before running pytest. Without keys, the rules extractor runs automatically.
