@@ -86,14 +86,16 @@ def _parse_llm_response(raw: str) -> list[ExtractedMemory]:
 
 class LLMExtractor:
     def __init__(self):
-        self.provider = os.getenv("LLM_PROVIDER", "deepseek")
-        self.model = os.getenv("LLM_MODEL", "deepseek-chat")
+        self.provider = os.getenv("LLM_PROVIDER", "openrouter")
+        self.model = os.getenv("LLM_MODEL", "deepseek/deepseek-chat")
         self.fallback_model = os.getenv("LLM_FALLBACK_MODEL", "gpt-4o-mini")
         self._rules = RulesExtractor()
 
     def _get_model_string(self, model: str) -> str:
         """Convert model name to litellm format."""
-        if self.provider == "deepseek":
+        if self.provider == "openrouter":
+            return f"openrouter/{model}"
+        elif self.provider == "deepseek":
             return f"deepseek/{model}"
         elif self.provider == "openai":
             return model
