@@ -1,0 +1,19 @@
+user_id: u_dave
+description: "Queries about topics never discussed"
+turns:
+  - session_id: s1
+    timestamp: "2025-03-10T10:00:00Z"
+    messages:
+      - role: user
+        content: "Can you help me write a Python script to parse CSV files?"
+      - role: assistant
+        content: "Of course! Here's a simple approach..."
+probes:
+  - query: "Where does the user live?"
+    must_include: []
+    must_be_empty: true
+    description: "No location info was discussed — should return empty"
+  - query: "What is the user's name?"
+    must_include: []
+    must_be_empty: true
+    description: "No name discussed — should return empty"

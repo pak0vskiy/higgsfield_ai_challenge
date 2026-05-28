@@ -1,0 +1,25 @@
+user_id: u_alice
+description: "User states location then corrects it"
+turns:
+  - session_id: s1
+    timestamp: "2025-03-10T10:00:00Z"
+    messages:
+      - role: user
+        content: "I just moved to Berlin from NYC last month. Loving it so far."
+      - role: assistant
+        content: "Welcome to Berlin! How are you settling in?"
+  - session_id: s2
+    timestamp: "2025-03-15T10:00:00Z"
+    messages:
+      - role: user
+        content: "Actually I moved to Munich, not Berlin. I got confused earlier."
+      - role: assistant
+        content: "Munich is lovely too!"
+probes:
+  - query: "Where does the user live?"
+    must_include: ["Munich"]
+    must_not_include: ["Berlin"]
+    description: "After correction, Munich should be active"
+  - query: "Has the user lived in Berlin?"
+    must_include: ["Berlin"]
+    description: "Berlin history should be preserved"

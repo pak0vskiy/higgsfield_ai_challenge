@@ -1,0 +1,25 @@
+user_id: u_bob
+description: "User changes jobs across sessions"
+turns:
+  - session_id: s1
+    timestamp: "2025-02-01T10:00:00Z"
+    messages:
+      - role: user
+        content: "I work at Stripe as an engineer."
+      - role: assistant
+        content: "That sounds like an exciting role!"
+  - session_id: s2
+    timestamp: "2025-03-15T10:00:00Z"
+    messages:
+      - role: user
+        content: "I just started at Notion last week. Really excited about the new role."
+      - role: assistant
+        content: "Congratulations on the new job!"
+probes:
+  - query: "Where does the user work?"
+    must_include: ["Notion"]
+    must_not_include: ["Stripe"]
+    description: "Notion should supersede Stripe"
+  - query: "Did the user work at Stripe?"
+    must_include: ["Stripe"]
+    description: "Stripe history should be preserved"

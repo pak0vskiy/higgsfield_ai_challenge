@@ -1,0 +1,27 @@
+user_id: u_eve
+description: "Implicit facts extracted from context"
+turns:
+  - session_id: s1
+    timestamp: "2025-03-10T10:00:00Z"
+    messages:
+      - role: user
+        content: "I was walking Biscuit this morning and the coffee shops in Berlin are amazing."
+      - role: assistant
+        content: "Sounds like a lovely morning!"
+  - session_id: s1
+    timestamp: "2025-03-10T10:10:00Z"
+    messages:
+      - role: user
+        content: "I'm vegetarian so finding good food is important to me."
+      - role: assistant
+        content: "Berlin has great vegetarian options!"
+probes:
+  - query: "Does the user have a pet?"
+    must_include: ["Biscuit"]
+    description: "Implicit pet from 'walking Biscuit'"
+  - query: "What is the user's diet?"
+    must_include: ["vegetarian"]
+    description: "Diet preference extracted"
+  - query: "Where does the user live?"
+    must_include: ["Berlin"]
+    description: "Location inferred from context"

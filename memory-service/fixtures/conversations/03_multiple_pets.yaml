@@ -1,0 +1,24 @@
+user_id: u_carol
+description: "User has multiple pets — no supersession"
+turns:
+  - session_id: s1
+    timestamp: "2025-03-10T10:00:00Z"
+    messages:
+      - role: user
+        content: "I have a cat named Mylo."
+      - role: assistant
+        content: "Mylo sounds adorable!"
+  - session_id: s1
+    timestamp: "2025-03-10T10:05:00Z"
+    messages:
+      - role: user
+        content: "I also have a dog named Biscuit."
+      - role: assistant
+        content: "Two pets! Lucky you."
+probes:
+  - query: "What pets does the user have?"
+    must_include: ["Mylo", "Biscuit"]
+    description: "Both pets should be in memory"
+  - query: "Does the user have a cat?"
+    must_include: ["Mylo"]
+    description: "Mylo the cat recalled"
