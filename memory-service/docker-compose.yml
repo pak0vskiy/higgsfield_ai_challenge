@@ -1,0 +1,19 @@
+services:
+  memory-service:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - memdata:/data
+    env_file:
+      - path: .env
+        required: false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  memdata:
