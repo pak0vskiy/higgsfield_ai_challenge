@@ -244,104 +244,108 @@ def recall(
     if not user_id:
         user_id = f"anon:{session_id}"
 
-    # Step 1: Always load profile facts (Tier-1, active)
-    profile_facts = _get_profile_facts(conn, user_id)
-    profile_ids = {f["id"] for f in profile_facts}
+    try:
+        # Step 1: Always load profile facts (Tier-1, active)
+        profile_facts = _get_profile_facts(conn, user_id)
+        profile_ids = {f["id"] for f in profile_facts}
 
-    # Step 2: BM25 search for query-relevant memories
-    fts_query = _build_fts_query(query)
-    relevant_rows = _get_relevant_memories(conn, user_id, fts_query, limit=20)
+        # Step 2: BM25 search for query-relevant memories
+        fts_query = _build_fts_query(query)
+        relevant_rows = _get_relevant_memories(conn, user_id, fts_query, limit=20)
 
-    # Normalize BM25 and compute final scores
-    bm25_raws = [r["bm25_raw"] for r in relevant_rows]
-    # BM25 from FTS5 is negative — negate so higher = better
-    bm25_raws_pos = [-s for s in bm25_raws]
-    bm25_norms = _normalize_bm25(bm25_raws_pos)
+        # Normalize BM25 and compute final scores
+        bm25_raws = [r["bm25_raw"] for r in relevant_rows]
+        # BM25 from FTS5 is negative — negate so higher = better
+        bm25_raws_pos = [-s for s in bm25_raws]
+        bm25_norms = _normalize_bm25(bm25_raws_pos)
 
-    for i, row in enumerate(relevant_rows):
-        bm25_n = bm25_norms[i] if bm25_norms else 0.0
-        recency = _recency_score(row.get("updated_at", ""))
-        confidence = float(row.get("confidence", 1.0))
-        active_boost = 1.0 if row.get("active") else 0.0
-        score = 0.70 * bm25_n + 0.15 * recency + 0.10 * confidence + 0.05 * active_boost
-        row["_final_score"] = score
+        for i, row in enumerate(relevant_rows):
+            bm25_n = bm25_norms[i] if bm25_norms else 0.0
+            recency = _recency_score(row.get("updated_at", ""))
+            confidence = float(row.get("confidence", 1.0))
+            active_boost = 1.0 if row.get("active") else 0.0
+            score = 0.70 * bm25_n + 0.15 * recency + 0.10 * confidence + 0.05 * active_boost
+            row["_final_score"] = score
 
-    relevant_rows.sort(key=lambda r: r["_final_score"], reverse=True)
+        relevant_rows.sort(key=lambda r: r["_final_score"], reverse=True)
 
-    # Noise resistance: if no profile facts AND top score < threshold → empty
-    top_score = relevant_rows[0]["_final_score"] if relevant_rows else 0.0
-    if not profile_facts and top_score < LOW_SCORE_THRESHOLD:
-        return {"context": "", "citations": []}
+        # Noise resistance: if no profile facts AND top score < threshold → empty
+        top_score = relevant_rows[0]["_final_score"] if relevant_rows else 0.0
+        if not profile_facts and top_score < LOW_SCORE_THRESHOLD:
+            return {"context": "", "citations": []}
 
-    # Step 3: Recent session turns
-    recent_turns = _get_recent_turns(conn, session_id, limit=5)
+        # Step 3: Recent session turns
+        recent_turns = _get_recent_turns(conn, session_id, limit=5)
 
-    # Step 4: Assemble context under token budget
-    all_citations = []
-    sections = []
-    tokens_used = 0
+        # Step 4: Assemble context under token budget
+        all_citations = []
+        sections = []
+        tokens_used = 0
 
-    # Priority 1: profile facts
-    profile_section, profile_citations = _format_profile_section(profile_facts)
-    if profile_section:
-        profile_tokens = _count_tokens(profile_section)
-        if tokens_used + profile_tokens <= max_tokens * 2:  # soft cap: don't exceed 2×
-            sections.append(profile_section)
-            tokens_used += profile_tokens
-            all_citations.extend(profile_citations)
+        # Priority 1: profile facts
+        profile_section, profile_citations = _format_profile_section(profile_facts)
+        if profile_section:
+            profile_tokens = _count_tokens(profile_section)
+            if tokens_used + profile_tokens <= max_tokens * 2:  # soft cap: don't exceed 2×
+                sections.append(profile_section)
+                tokens_used += profile_tokens
+                all_citations.extend(profile_citations)
 
-    # Priority 2: query-relevant memories (greedy fill)
-    RELEVANT_HEADER = "## Relevant from past conversations\n"
-    relevant_header_tokens = _count_tokens(RELEVANT_HEADER)
-    relevant_lines = []
-    relevant_citations = []
-    for m in relevant_rows:
-        if m["id"] in profile_ids:
-            continue
-        ts = m.get("updated_at", "")[:10]
-        val = m["value_text"]
-        evidence = m.get("evidence", "")
-        snippet = evidence if evidence else val
-        line = f"- [{ts}] {val}"
-        line_tokens = _count_tokens(line)
-        # Reserve tokens for the section header on the first line
-        header_overhead = relevant_header_tokens if not relevant_lines else 0
-        if tokens_used + header_overhead + line_tokens > max_tokens * 2:
-            break
-        relevant_lines.append(line)
-        tokens_used += header_overhead + line_tokens
-        if m.get("source_turn_id"):
-            relevant_citations.append({
-                "turn_id": m["source_turn_id"],
-                "score": round(m.get("_final_score", 0.0), 4),
-                "snippet": snippet[:200],
-            })
+        # Priority 2: query-relevant memories (greedy fill)
+        RELEVANT_HEADER = "## Relevant from past conversations\n"
+        relevant_header_tokens = _count_tokens(RELEVANT_HEADER)
+        relevant_lines = []
+        relevant_citations = []
+        for m in relevant_rows:
+            if m["id"] in profile_ids:
+                continue
+            ts = m.get("updated_at", "")[:10]
+            val = m["value_text"]
+            evidence = m.get("evidence", "")
+            snippet = evidence if evidence else val
+            line = f"- [{ts}] {val}"
+            line_tokens = _count_tokens(line)
+            # Reserve tokens for the section header on the first line
+            header_overhead = relevant_header_tokens if not relevant_lines else 0
+            if tokens_used + header_overhead + line_tokens > max_tokens * 2:
+                break
+            relevant_lines.append(line)
+            tokens_used += header_overhead + line_tokens
+            if m.get("source_turn_id"):
+                relevant_citations.append({
+                    "turn_id": m["source_turn_id"],
+                    "score": round(m.get("_final_score", 0.0), 4),
+                    "snippet": snippet[:200],
+                })
 
-    if relevant_lines:
-        sections.append("## Relevant from past conversations\n" + "\n".join(relevant_lines))
-        all_citations.extend(relevant_citations)
-
-    # Priority 3: recent session turns (if budget allows)
-    recent_lines = []
-    for turn in recent_turns[:2]:
-        ts = turn["timestamp"][:10] if turn.get("timestamp") else ""
-        snippet = turn["snippet"]
-        line = f"- [{ts}] {snippet}"
-        line_tokens = _count_tokens(line)
-        if tokens_used + line_tokens > max_tokens * 2:
-            break
-        recent_lines.append(line)
-        tokens_used += line_tokens
-
-    if recent_lines:
-        # Don't add a separate section — merge into relevant if relevant section exists
         if relevant_lines:
-            sections[-1] += "\n" + "\n".join(recent_lines)
-        else:
-            sections.append("## Relevant from past conversations\n" + "\n".join(recent_lines))
+            sections.append("## Relevant from past conversations\n" + "\n".join(relevant_lines))
+            all_citations.extend(relevant_citations)
 
-    context = "\n\n".join(sections)
-    return {"context": context, "citations": all_citations}
+        # Priority 3: recent session turns (if budget allows)
+        recent_lines = []
+        for turn in recent_turns[:2]:
+            ts = turn["timestamp"][:10] if turn.get("timestamp") else ""
+            snippet = turn["snippet"]
+            line = f"- [{ts}] {snippet}"
+            line_tokens = _count_tokens(line)
+            if tokens_used + line_tokens > max_tokens * 2:
+                break
+            recent_lines.append(line)
+            tokens_used += line_tokens
+
+        if recent_lines:
+            # Don't add a separate section — merge into relevant if relevant section exists
+            if relevant_lines:
+                sections[-1] += "\n" + "\n".join(recent_lines)
+            else:
+                sections.append("## Relevant from past conversations\n" + "\n".join(recent_lines))
+
+        context = "\n\n".join(sections)
+        return {"context": context, "citations": all_citations}
+    except Exception as e:
+        logger.error("recall failed for user=%s session=%s: %s", user_id, session_id, e)
+        return {"context": "", "citations": []}
 
 
 def search(
