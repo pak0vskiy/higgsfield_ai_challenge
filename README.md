@@ -157,7 +157,6 @@ A noise guard returns empty context when there are no profile facts AND the top 
 
 ```bash
 # Install dependencies (Python 3.12+)
-cd memory-service
 pip install -e ".[test]"
 
 # Run all tests (no API key needed — uses fake embedder + rules extractor)
