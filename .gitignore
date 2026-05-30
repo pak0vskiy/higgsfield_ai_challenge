@@ -6,5 +6,3 @@ __pycache__/
 dist/
 *.egg-info/
 .worktrees/
-ARCHITECTURE_RECOMMENDATION.md
-TASK_REQUIREMENTS.md
