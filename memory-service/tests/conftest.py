@@ -2,9 +2,14 @@ import os
 import importlib
 import pytest
 import asyncio
+from dotenv import load_dotenv
+
+# Load .env first so its values are in os.environ before setdefault calls below.
+# load_dotenv() does not override vars already set in the OS environment.
+load_dotenv()
 
 # Use rules extractor by default (no LLM key needed).
-# Override by setting MEMORY_EXTRACTOR=llm in your environment.
+# Override by setting MEMORY_EXTRACTOR=llm in your environment or .env.
 os.environ.setdefault("MEMORY_EXTRACTOR", "rules")
 
 # Use fake (deterministic) embedder with a small dimension by default so
