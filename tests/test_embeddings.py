@@ -11,7 +11,8 @@ import importlib
 def _get_embeddings_module(provider: str = "fake"):
     """Reload embeddings module with the given provider. Defaults to 'fake'."""
     os.environ["EMBEDDINGS_PROVIDER"] = provider
-    os.environ.setdefault("EMBEDDING_DIM", "64")
+    # Clear any cached EMBEDDING_DIM so the module picks the provider-aware default
+    os.environ.pop("EMBEDDING_DIM", None)
     import memory_service.embeddings as m
     importlib.reload(m)
     return m
@@ -21,7 +22,7 @@ def test_fake_embed_returns_correct_dimension():
     emb = _get_embeddings_module()
     vec = emb.embed("Hello, world!")
     assert vec is not None
-    assert len(vec) == int(os.environ.get("EMBEDDING_DIM", "64"))
+    assert len(vec) == emb.EMBEDDING_DIM
 
 
 def test_fake_embed_is_deterministic():

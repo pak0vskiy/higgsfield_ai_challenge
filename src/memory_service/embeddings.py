@@ -25,7 +25,13 @@ logger = logging.getLogger(__name__)
 # ── Configuration ──────────────────────────────────────────────────────────────
 EMBEDDINGS_PROVIDER = os.getenv("EMBEDDINGS_PROVIDER", "openai").lower()
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536"))
+
+# Dimension defaults are provider-aware so no manual EMBEDDING_DIM config is needed:
+#   fake  → 64  (small, fast, no API call)
+#   openai → 1536 (text-embedding-3-small)
+# Override with EMBEDDING_DIM env var if needed.
+_DEFAULT_DIM = 64 if EMBEDDINGS_PROVIDER == "fake" else 1536
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", str(_DEFAULT_DIM)))
 
 
 # ── Fake (deterministic) embedder ──────────────────────────────────────────────
