@@ -10,6 +10,9 @@ dependencies = [
     "tiktoken>=0.7.0",
     "pyyaml>=6.0",
     "python-dotenv>=1.0.0",
+    "sqlite-vec>=0.1.6",
+    "rapidfuzz>=3.9.0",
+    "numpy>=1.26.0",
 ]
 
 [project.optional-dependencies]

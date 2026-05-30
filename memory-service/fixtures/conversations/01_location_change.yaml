@@ -1,5 +1,10 @@
 user_id: u_alice
-description: "User states location then corrects it"
+description: >
+  User states location then explicitly retracts it.
+  Correction semantics: the prior value (Berlin) was never correct, so it is NOT
+  preserved as location.previous — this differs from a genuine update (supersession),
+  where the old value IS written to .previous. The corrected current location (Munich)
+  must be the only active fact.
 turns:
   - session_id: s1
     timestamp: "2025-03-10T10:00:00Z"
@@ -19,7 +24,7 @@ probes:
   - query: "Where does the user live?"
     must_include: ["Munich"]
     must_not_include: ["Berlin"]
-    description: "After correction, Munich should be active"
-  - query: "Has the user lived in Berlin?"
-    must_include: ["Berlin"]
-    description: "Berlin history should be preserved"
+    description: "After correction, Munich should be active and Berlin should not appear"
+  - query: "Where does the user currently live?"
+    must_include: ["Munich"]
+    description: "Munich is the current (corrected) location"

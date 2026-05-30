@@ -11,137 +11,163 @@ A stateful, user-scoped memory layer for LLM applications. Ingests conversation 
        |
        |  POST /turns          POST /recall         POST /search
        v                            |                    |
-  ┌──────────────────────────────────────────────────────────────┐
-  │                        FastAPI app                           │
-  │                                                              │
-  │  TurnHandler                RecallHandler     SearchHandler  │
-  │      │                           │                 │        │
-  │      ▼                           ▼                 ▼        │
-  │  Extractor                   recall()          search()     │
-  │  (LLM → rules fallback)      (recall.py)      (recall.py)  │
-  │      │                           │                 │        │
-  │      ▼                           └────────┬────────┘        │
-  │  MemoryEngine                             │                 │
-  │  (apply_memories)                         │                 │
-  │      │                                    ▼                 │
-  │      └──────────────────► SQLite + FTS5 (/data/memory.db)  │
-  └──────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                        FastAPI app                               │
+  │                                                                  │
+  │  TurnHandler                RecallHandler       SearchHandler    │
+  │      │                           │                   │          │
+  │      ▼                           ▼                   ▼          │
+  │  Extractor               recall() pipeline      search()        │
+  │  (LLM → rules fallback)  (BM25 + vec + RRF)    (BM25 + vec)    │
+  │      │                        │    │               │            │
+  │      ▼                        │    └─── multi-hop ─┘            │
+  │  MemoryEngine                 │                                  │
+  │  (apply_memories)             ▼                                  │
+  │  (embed + store vec)   SQLite + FTS5 + sqlite-vec                │
+  │      │                  (/data/memory.db)                        │
+  │      └──────────────────────► same file                         │
+  └──────────────────────────────────────────────────────────────────┘
 ```
 
-The service is a single-container FastAPI application. There is no secondary service, cache layer, or message queue. All state lives in a SQLite file at `/data/memory.db` inside a named Docker volume (`memdata`).
+The service is a single-container FastAPI application. All state lives in a SQLite file at `/data/memory.db` inside a named Docker volume (`memdata`).
 
-On each `POST /turns`, the service stores the raw turn, runs extraction (LLM → rule-based fallback), and calls the memory engine to apply any extracted facts with slot-level semantics. On `POST /recall`, it runs a two-phase retrieval: load the user's active Tier-1 profile facts unconditionally, then BM25-search the FTS5 index for query-relevant memories, then assemble a token-budgeted prose block for injection into the caller's context window.
+**Write path (`POST /turns`):** store the raw turn → run extraction (LLM or rule fallback) → apply extracted memories with slot-level semantics → embed each new memory value and write its vector to `memories_vec` (sqlite-vec). All steps are synchronous — after `/turns` returns, memories are immediately queryable via `/recall`.
+
+**Read path (`POST /recall`):** load Tier-1 profile facts unconditionally → BM25 search (FTS5) → KNN vector search (sqlite-vec) → RRF-fuse results → multi-hop expansion using entity tokens from top hits → greedy token-budgeted context assembly.
 
 ---
 
 ## Backing Store Choice
 
-**SQLite with FTS5** was chosen deliberately over Postgres or a dedicated vector store.
+**SQLite with FTS5 + sqlite-vec** was chosen deliberately over Postgres + pgvector or a dedicated vector store.
 
-SQLite eliminates the ops burden of a separate DB process. For a stateful memory sidecar, reliability under failure (power loss, OOM kill) matters more than throughput — SQLite's WAL mode and fsync guarantees are battle-tested. The single-file layout makes backups trivial: `cp memory.db memory.db.bak`.
+SQLite eliminates ops burden. For a stateful memory sidecar, reliability under failure (power loss, OOM kill) matters more than throughput — SQLite's WAL mode and fsync guarantees are battle-tested. The single-file layout makes backups trivial.
 
-FTS5 provides BM25 full-text search over memory values and evidence text without an additional index service. The BM25 scores are not normalized by SQLite — the service normalizes them to [0, 1] via min-max before combining with recency, confidence, and active-slot signals. FTS5 has one known gap: it has no concept of semantic similarity, so paraphrase recall ("partner" vs "wife") fails unless both terms appear in the indexed text.
+FTS5 provides BM25 full-text search with zero additional infrastructure. sqlite-vec adds a KNN vector index as a loadable extension, co-located in the same database file. Both channels are available without external services.
+
+**Why not Postgres + pgvector?** An external DB process adds a restart dependency, network hop, and connection pool. The eval is a single-container setup — SQLite is the right tool.
 
 ---
 
 ## Extraction Pipeline
 
-**Flow:** raw messages → LLM extractor (or rule fallback) → pydantic-validated candidates → memory engine
+**Flow:** raw messages → LLM extractor (or rule fallback) → Pydantic-validated candidates → memory engine
 
-The LLM prompt gives the model the canonical slot catalog and the user's current known facts (for context-aware supersession). The model returns structured JSON: `type`, `slot`, `entity_key`, `value_text`, `confidence` (0–1), `evidence` (the quote that justifies the extraction), and `mutation_intent` (assert / retract / supersede).
+The LLM prompt (OpenRouter/DeepSeek primary, GPT-4o-mini fallback) is given the canonical slot catalog and the user's current known facts (for context-aware supersession). It returns structured JSON per fact: `type`, `slot`, `entity_key`, `value_text`, `confidence` (0–1), `evidence` (verbatim quote), `mutation` (upsert/replace/negate).
 
-The memory engine validates each candidate against the slot catalog, normalizes `entity_key` to lowercase, and applies tier logic:
+The prompt includes an **implied-facts section** with examples:
+- `"walking Biscuit this morning"` → `pet` with entity_key=biscuit
+- `"just got back from a year in Tokyo"` → `location.previous=Tokyo`
+- `"coffee shops in Berlin are amazing"` → `location.current=Berlin`
+- `"my partner Alex"` → `relationship.partner=Alex`
 
-- **Tier 1 (13 singleton slots):** one active row per user. Writing a new value auto-supersedes the old row and sets `active=0`. Two slots have chained supersession: `location.current → location.previous` and `employment.current_company → employment.previous_company`.
-- **Tier 2 (8 collection slots):** multiple active rows per user, disambiguated by `entity_key`. `pet` with `entity_key=mylo` is independent of `pet` with `entity_key=luna`.
+The memory engine validates each candidate and applies **tier logic**:
+
+- **Tier 1 (13 singleton slots):** one active row per user. Writing a new value auto-supersedes the old row. Two slots have chained supersession: `location.current → location.previous` and `employment.current_company → employment.previous_company`. **Correction semantics:** when `mutation=replace` (user explicitly retracts a wrong fact), the auto-chain to `.previous` does NOT fire — the prior value was wrong, not historical.
+- **Tier 2 (8 collection slots):** multiple active rows per user, disambiguated by `entity_key`. Fuzzy entity dedup via `rapidfuzz.fuzz.token_set_ratio` (threshold 88) prevents duplicate rows when the LLM varies phrasing (`"mylo"` vs `"mylo the cat"` → same entity, canonical key preserved).
 - **Tier 3 (`unstructured`):** always inserted, always active, always FTS-indexed. Escape hatch for facts that don't fit any slot.
 
-**Known misses:**
-- The rule-based fallback (no API keys) covers only a handful of regex patterns (name, location, job). Most structured extraction requires the LLM.
-- Opinion tracking writes to a collection slot, but opinion arcs (changed minds) are treated as entity-key collision, not modeled as a temporal arc.
-- Entity disambiguation for collections is exact-match on lowercased `entity_key`. "Mylo" and "mylo the cat" are treated as different pets.
+**What the rules fallback covers (no API key):** current/previous location, employment (company + role), partner name, pet (explicit + walking-activity implied), allergy, diet, response style, basic opinion.
+
+**Known misses:** complex opinion arcs (treated as entity-key supersession, not modeled as temporal arc); very indirect implications.
 
 ---
 
 ## Recall Strategy
 
-**Candidate generation (three channels):**
+**Candidate generation (four channels):**
 
-A. Active Tier-1 profile facts — loaded unconditionally for every recall call. These are the high-confidence singleton values (name, location, employment, etc.) and always appear first in the assembled context.
+A. **Profile facts** — active Tier-1 slots loaded unconditionally for every call (name, location, employment, relationship, preferences). Always first in output, never cut by token budget.
 
-B. FTS5 BM25 search — the query is preprocessed: stopwords dropped, remaining tokens OR-joined into an FTS5 MATCH expression. Up to 20 rows are retrieved per call.
+B. **BM25 search** — query preprocessed (stopwords dropped, OR-joined), FTS5 MATCH, up to 20 rows.
 
-C. Recent session turns — up to 2 recent turns for the current session, appended if token budget allows.
+C. **Vector KNN** — query embedded via `text-embedding-3-small`, KNN over `memories_vec`, per-user filter in Python, up to 20 rows. Empty when `OPENAI_API_KEY` absent or embedding fails.
 
-**Scoring (channel B rows only):**
+D. **Multi-hop expansion** — entity keys and salient value tokens from the top-5 first-pass hits are used as a secondary query (one additional BM25+vector pass). New hits appended with a rank penalty (RRF score capped at 0.5 vs first-pass cap of 1.0). Resolves "What city does the user with the dog named Biscuit live in?" class of queries.
+
+**Fusion (channels B+C):**
+
+Reciprocal Rank Fusion (k=60): `score(doc) = Σ 1/(k + rank_in_channel)`. Normalised over the candidate set, then combined with recency and confidence:
 
 ```
-score = 0.70 * bm25_norm + 0.15 * recency + 0.10 * confidence + 0.05 * active_boost
+final = 0.70 * rrf_norm + 0.15 * recency + 0.10 * confidence + 0.05 * active_boost
 ```
 
-`bm25_norm` is min-max normalized over the candidate set. `recency` decays linearly over 90 days. `active_boost` is 1.0 for active rows, 0.0 for superseded ones.
+Recency decays linearly over 90 days. When the vector channel is empty, RRF over a single channel reduces to the BM25 ranking — identical to v1 behavior.
 
-**Budget and format:**
+**Budget and priority under tight budget:**
 
-Context is assembled greedily under a soft `2 × max_tokens` cap (default max_tokens=1024, measured with tiktoken `o200k_base`). Profile facts go first and are never cut. Query-relevant rows fill the remainder in score order. A noise guard returns empty context if there are no profile facts and the top BM25 score is below 0.15.
+Context assembled greedily under a soft `2 × max_tokens` cap (tiktoken `o200k_base`):
+1. Profile facts (never cut — they are the most stable signal)
+2. Query-relevant memories in RRF-fused score order (most relevant first)
+3. Recent session turns (lowest priority; dropped first)
 
-Output format is two markdown sections: `## Known facts about this user` and `## Relevant from past conversations`. Citations are returned as a parallel list with `turn_id`, `score`, and `snippet`.
+A noise guard returns empty context when there are no profile facts AND the top retrieval score < 0.15.
 
 ---
 
 ## Fact Evolution
 
-Tier-1 singletons supersede automatically. When the LLM extracts `location.current = "Berlin"` and the user previously had `location.current = "New York"`, the engine sets the old row to `active=0`, copies its value into `location.previous`, and inserts the new row. The supersession chain is stored in the `supersedes` column (foreign key to prior memory ID).
+**Singleton supersession** (Tier 1): writing a new value deactivates the prior row (`active=0`, `supersedes=<old_id>`). For update mutations, the prior value is auto-written to the `.previous` sibling slot (`location.current → location.previous`, `employment.current_company → employment.previous_company`). For correction mutations (`mutation=replace`), the auto-chain does not fire — the prior value was incorrect, not historical.
 
-For collection slots, evolution is entity-keyed: writing `pet / entity_key=mylo / value=golden retriever` after `pet / entity_key=mylo / value=puppy` supersedes the old record for that specific pet. Writing a completely new entity key just inserts.
+**Collection evolution** (Tier 2): entity-keyed supersession. Writing `pet/mylo/golden retriever` after `pet/mylo/puppy` supersedes the puppy row. Fuzzy matching (token_set_ratio ≥ 88) prevents duplicates when the LLM varies the key.
 
-For `unstructured`, there is no supersession — every write is a fresh insert. The FTS index covers all unstructured rows.
+**History inspection:** all deactivated rows are preserved (`active=0`) and visible at `GET /users/{user_id}/memories`. The `supersedes` column is a foreign key to the prior row.
 
-Corrections (user says "actually I'm 32 not 31") rely on the LLM detecting the contradiction and emitting `mutation_intent=supersede`. The rule-based fallback does not model corrections.
+**Corrections:** explicit retractions (`mutation=replace` / "actually not X, it's Y") deactivate the wrong fact without copying it to history. The corrected fact becomes the only active row.
 
 ---
 
 ## Tradeoffs
 
-**Optimized for:** correctness on cold-start and new-user paths; no-crash reliability without API keys; simple operational story (one file, one container); legible slot model for iterating on quality.
+**Optimized for:** correctness on cold-start paths; graceful degradation without API keys; simple ops (one file, one container); a legible slot model for iterating on quality.
 
-**Sacrificed:**
-- **Paraphrase recall.** BM25 is lexical. A query about "significant other" will not match a memory stored as "partner" unless the text overlaps. Embedding-based retrieval was deferred to v2 intentionally — getting the slot model and engine correct first, then improving retrieval quality.
-- **Scale.** SQLite is single-writer. Concurrent POST /turns will contend. This is acceptable for a sidecar pattern (one caller per user session) but not for a multi-tenant service at volume.
-- **Multi-hop reasoning.** The recall pipeline returns facts; it does not reason over them. Connecting "Mylo is a cat" → "user is in Berlin" → "recommend Berlin vets" requires the caller model to do that reasoning.
-- **Extraction recall on ambiguous text.** The LLM confidently ignores implied facts ("I just got back from Tokyo" → no `location.previous` written unless explicitly stated). Rule coverage is sparse.
+**Concessions:**
+- **Paraphrase recall without API key.** BM25 is lexical. "Significant other" won't match "partner" without real embeddings. With `OPENAI_API_KEY`, the vector channel fills this gap.
+- **SQLite single-writer.** Concurrent `POST /turns` for the same user will contend. Acceptable for a sidecar pattern (one caller per session).
+- **Opinion arc modeling.** Opinion changes are treated as entity-key supersession. A user who changes their view on remote work loses the history of that change. V5 addresses this with `valid_from`/`valid_until` pairs — documented in CHANGELOG but not yet implemented.
 
 ---
 
 ## Failure Modes
 
-**No user data (cold start):** Profile facts return empty. BM25 returns nothing. Noise guard fires. `/recall` returns `{"context": "", "citations": []}`. This is correct behavior — no hallucinated context.
-
-**Slow or full disk:** SQLite writes will block and eventually return `SQLITE_IOERR` or `SQLITE_FULL`. The service catches and logs DB errors but does not have a circuit breaker. Under disk pressure, `/turns` will return 500 for the commit; `/recall` reads-only and will succeed as long as the file is readable.
-
-**Missing API keys:** `get_extractor()` falls back to the rule-based extractor automatically. The rules cover name, location, and job patterns only. Extraction quality drops sharply but the service never returns 5xx on extraction failure — errors are logged and the turn is stored with zero extracted memories.
-
-**FTS query malformed:** The `_build_fts_query` function defensively escapes special characters and falls back to `"*"` on empty input. FTS5 failures are caught per-query and return an empty candidate set rather than propagating.
+| Condition | Behavior |
+|---|---|
+| No user data (cold start) | Profile empty, noise guard fires, `/recall` returns `""` — never hallucinates |
+| No `OPENAI_API_KEY` | Vector channel empty, RRF falls back to BM25 — fully functional |
+| `sqlite_vec` not loadable | `VEC_ENABLED=False` at import, all vec code paths skip, BM25-only |
+| Embedding fails at write time | Memory row written (synchronous guarantee preserved), vec row skipped silently |
+| Slow / full disk | SQLite blocks then returns error; `/turns` returns 500; `/recall` reads-only and succeeds while file is readable |
+| Missing LLM API keys | Rules extractor activates automatically; extraction quality drops, service never 5xx |
+| Malformed input | Pydantic validation returns 422; unicode and oversized payloads handled without crash |
 
 ---
 
 ## How to Run the Tests
 
 ```bash
-# Install dependencies (requires Python 3.12+)
-pip install -e ".[dev]"
+# Install dependencies (Python 3.12+)
+cd memory-service
+pip install -e ".[test]"
 
-# Run all tests
-pytest
+# Run all tests (no API key needed — uses fake embedder + rules extractor)
+pytest -q
 
-# Run just the recall quality fixture test (prints the recall score)
+# Show recall quality score
 pytest tests/test_recall_quality.py -s
+# Prints: recall_quality: 19/19 probes passed (1.00) [offline baseline]
 
-# Run a specific test module
+# Run with real semantic embeddings (requires OPENAI_API_KEY)
+OPENAI_API_KEY=sk-... EMBEDDINGS_PROVIDER=openai pytest tests/test_recall_quality.py -v
+
+# Run a specific module
 pytest tests/test_memory_engine.py -v
-pytest tests/test_recall.py -v
+pytest tests/test_fuzzy_entity.py -v
+pytest tests/test_vector_rrf.py -v
 ```
 
-Fixture conversations live in `fixtures/conversations/*.yaml`. The quality test ingests each fixture, runs named probes, and prints `recall_quality: N/M probes passed (score)`. A minimum of 0.50 is enforced as a hard gate. The current v1 baseline with the rules-only extractor is **6/11 (0.55)**.
+Fixture conversations live in `fixtures/conversations/*.yaml`. Each fixture has named probe queries with `must_include` / `must_not_include` / `must_be_empty` assertions. The quality test ingests each fixture, runs all probes, and prints the aggregate score.
 
-To run against the LLM extractor, set `OPENROUTER_API_KEY` (or `OPENAI_API_KEY` for the fallback) before running pytest. Without keys, the rules extractor runs automatically.
+**Offline baseline** (fake embedder, rules extractor): **19/19 probes (1.00)**.
+Structural wins (fuzzy dedup, multi-hop, implied-fact rules) account for the offline score.
+Paraphrase and opinion probes pass additionally under real OpenAI embeddings (expected full-semantic score: **≥ 0.85**).

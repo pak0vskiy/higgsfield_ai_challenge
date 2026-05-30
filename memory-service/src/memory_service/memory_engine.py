@@ -1,4 +1,4 @@
-import json, uuid, logging
+import json, uuid, logging, os
 from datetime import datetime, timezone
 from sqlite3 import Connection
 from memory_service.extractor.base import ExtractedMemory
@@ -7,6 +7,11 @@ from memory_service.slots import is_singleton, is_collection, get_previous_slot,
 logger = logging.getLogger(__name__)
 
 LOW_CONFIDENCE_THRESHOLD = 0.45
+
+# Fuzzy entity-key matching threshold (0-100, Jaro-Winkler similarity).
+# Keys scoring >= this are treated as the same entity (supersession).
+ENTITY_FUZZY_THRESHOLD = int(os.getenv("ENTITY_FUZZY_THRESHOLD", "88"))
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -30,6 +35,30 @@ def _deactivate(conn: Connection, memory_id: str, now: str) -> None:
         "UPDATE memories SET active=0, updated_at=? WHERE id=?",
         (now, memory_id)
     )
+
+
+def _store_vec(conn: Connection, rowid: int, value_text: str) -> None:
+    """
+    Embed *value_text* and store the vector in memories_vec.
+    Silently no-ops if sqlite-vec is unavailable or embedding fails — the
+    synchronous-correctness guarantee applies to the relational write, not the
+    vector index.
+    """
+    from memory_service.db import VEC_ENABLED
+    if not VEC_ENABLED:
+        return
+    try:
+        from memory_service.embeddings import embed, serialize_f32
+        vec = embed(value_text)
+        if vec is None:
+            return
+        blob = serialize_f32(vec)
+        conn.execute(
+            "INSERT OR REPLACE INTO memories_vec(memory_rowid, embedding) VALUES (?, ?)",
+            (rowid, blob)
+        )
+    except Exception as e:
+        logger.warning("Vector index write failed for rowid=%d: %s", rowid, e)
 
 
 def _insert_memory(
@@ -59,7 +88,47 @@ def _insert_memory(
             now, now,
         )
     )
+    # Fetch the rowid of the just-inserted row for the vector index
+    row = conn.execute("SELECT rowid FROM memories WHERE id=?", (mem_id,)).fetchone()
+    if row:
+        _store_vec(conn, row[0], mem.value_text)
     return mem_id
+
+
+def _fuzzy_match_entity_key(
+    existing_keys: list[str],
+    incoming_key: str,
+) -> str | None:
+    """
+    Return the best-matching existing entity_key if it scores >= ENTITY_FUZZY_THRESHOLD
+    (token_set_ratio, 0-100 scale), otherwise None.
+
+    token_set_ratio handles the case where one key is a shorter form of the other:
+      "mylo" vs "mylo the cat"  → 100 (mylo is contained in the longer form)
+      "mylo" vs "biscuit"       →  0  (no token overlap)
+
+    Length guard: the shorter key must be >= 3 characters to avoid merging
+    very short abbreviations that could collide by chance.
+    """
+    if len(incoming_key) < 3:
+        return None
+    try:
+        from rapidfuzz import fuzz
+        best_key = None
+        best_score = 0.0
+        for key in existing_keys:
+            if len(key) < 3:
+                continue
+            score = fuzz.token_set_ratio(incoming_key, key)
+            if score > best_score:
+                best_score = score
+                best_key = key
+        if best_score >= ENTITY_FUZZY_THRESHOLD:
+            return best_key
+        return None
+    except Exception as e:
+        logger.warning("Fuzzy entity matching failed: %s", e)
+        return None
 
 
 def _apply_singleton(
@@ -100,9 +169,11 @@ def _apply_singleton(
         now=now,
     )
 
-    # Auto-write previous slot chain
+    # Auto-write previous slot chain — only for genuine updates, not corrections.
+    # A "replace" or "negate" mutation means the prior value was wrong/retracted,
+    # so we should NOT preserve it in the .previous slot.
     prev_slot = get_previous_slot(mem.slot)
-    if prev_slot and prior_value and active == 1:
+    if prev_slot and prior_value and active == 1 and mem.mutation not in ("replace", "negate"):
         # Write the prior value into the .previous slot (upsert)
         from memory_service.extractor.base import ExtractedMemory as EM
         prev_mem = EM(
@@ -135,22 +206,46 @@ def _apply_collection(
     mem: ExtractedMemory,
     now: str,
 ) -> str:
-    """Apply a Tier-2 collection memory (entity_key-aware)."""
-    entity_key = mem.entity_key.strip().lower() if mem.entity_key else "unknown"
-    existing = conn.execute(
-        "SELECT id, value_text FROM memories WHERE user_id=? AND slot=? AND entity_key=? AND active=1",
-        (user_id, mem.slot, entity_key)
-    ).fetchone()
+    """Apply a Tier-2 collection memory (entity_key-aware, fuzzy-matched)."""
+    incoming_key = mem.entity_key.strip().lower() if mem.entity_key else "unknown"
+
+    # Fetch all active entity keys for this (user, slot) to attempt fuzzy dedup
+    existing_rows = conn.execute(
+        "SELECT id, entity_key, value_text FROM memories WHERE user_id=? AND slot=? AND active=1",
+        (user_id, mem.slot)
+    ).fetchall()
 
     supersedes_id = None
-    if existing:
-        if existing["value_text"].strip().lower() == mem.value_text.strip().lower():
-            return existing["id"]
-        _deactivate(conn, existing["id"], now)
-        supersedes_id = existing["id"]
+    resolved_key = incoming_key
 
-    # Use normalized entity_key
-    mem_with_key = mem.model_copy(update={"entity_key": entity_key})
+    if existing_rows:
+        existing_keys = [r["entity_key"] for r in existing_rows]
+
+        # First try exact match
+        exact = next((r for r in existing_rows if r["entity_key"] == incoming_key), None)
+        if exact:
+            if exact["value_text"].strip().lower() == mem.value_text.strip().lower():
+                return exact["id"]
+            _deactivate(conn, exact["id"], now)
+            supersedes_id = exact["id"]
+        else:
+            # Try fuzzy match
+            fuzzy_key = _fuzzy_match_entity_key(existing_keys, incoming_key)
+            if fuzzy_key is not None:
+                fuzzy_row = next((r for r in existing_rows if r["entity_key"] == fuzzy_key), None)
+                if fuzzy_row:
+                    if fuzzy_row["value_text"].strip().lower() == mem.value_text.strip().lower():
+                        return fuzzy_row["id"]
+                    logger.debug(
+                        "Fuzzy entity merge: '%s' -> '%s' (slot=%s, user=%s)",
+                        incoming_key, fuzzy_key, mem.slot, user_id
+                    )
+                    _deactivate(conn, fuzzy_row["id"], now)
+                    supersedes_id = fuzzy_row["id"]
+                    # Keep the canonical (existing) key rather than the new variant
+                    resolved_key = fuzzy_key
+
+    mem_with_key = mem.model_copy(update={"entity_key": resolved_key})
     active = 1 if mem.confidence >= LOW_CONFIDENCE_THRESHOLD else 0
     return _insert_memory(
         conn,

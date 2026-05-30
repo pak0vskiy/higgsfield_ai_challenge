@@ -1,0 +1,26 @@
+user_id: u_frank
+description: "Paraphrase probe — 'significant other' vs stored 'partner'. Passes with semantic embeddings; BM25-only may miss."
+turns:
+  - session_id: s1
+    timestamp: "2025-03-10T10:00:00Z"
+    messages:
+      - role: user
+        content: "My partner Alex and I just moved in together."
+      - role: assistant
+        content: "Congratulations on moving in together!"
+  - session_id: s1
+    timestamp: "2025-03-10T10:05:00Z"
+    messages:
+      - role: user
+        content: "Alex loves cooking so we have great meals at home."
+      - role: assistant
+        content: "That sounds wonderful!"
+probes:
+  - query: "Does the user have a significant other?"
+    must_include: ["Alex"]
+    description: >
+      Paraphrase: 'significant other' → stored as 'partner Alex'.
+      Passes under semantic embeddings (v2+); may fail with BM25-only (v1).
+  - query: "Who is the user's partner?"
+    must_include: ["Alex"]
+    description: "Direct lexical match — passes in v1."

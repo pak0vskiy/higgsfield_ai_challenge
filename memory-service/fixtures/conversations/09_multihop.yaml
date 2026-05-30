@@ -1,0 +1,27 @@
+user_id: u_iris
+description: "Multi-hop recall: connecting pet name → city of residence"
+turns:
+  - session_id: s1
+    timestamp: "2025-03-10T10:00:00Z"
+    messages:
+      - role: user
+        content: "I have a dog named Biscuit."
+      - role: assistant
+        content: "Biscuit is a great dog name!"
+  - session_id: s1
+    timestamp: "2025-03-10T10:05:00Z"
+    messages:
+      - role: user
+        content: "I live in Amsterdam. It's a wonderful city for dog owners."
+      - role: assistant
+        content: "Amsterdam is beautiful and very dog-friendly!"
+probes:
+  - query: "What city does the user with the dog named Biscuit live in?"
+    must_include: ["Amsterdam"]
+    description: >
+      Multi-hop: query mentions 'Biscuit' (surfaced by first pass), multi-hop links to
+      location.current=Amsterdam. Profile facts include location so this also passes via
+      unconditional profile inclusion.
+  - query: "Does the user have a pet?"
+    must_include: ["Biscuit"]
+    description: "Direct pet query — should always pass."

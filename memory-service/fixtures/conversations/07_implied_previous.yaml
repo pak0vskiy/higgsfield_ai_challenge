@@ -1,0 +1,24 @@
+user_id: u_grace
+description: "Implied location.previous from 'just got back from a year in Tokyo'"
+turns:
+  - session_id: s1
+    timestamp: "2025-03-10T10:00:00Z"
+    messages:
+      - role: user
+        content: "I just got back from a year in Tokyo. It was an incredible experience."
+      - role: assistant
+        content: "Tokyo is an amazing city! How are you finding being back?"
+  - session_id: s1
+    timestamp: "2025-03-10T10:05:00Z"
+    messages:
+      - role: user
+        content: "I'm in London now and settling back in."
+      - role: assistant
+        content: "London is a great place to be!"
+probes:
+  - query: "Where has the user previously lived?"
+    must_include: ["Tokyo"]
+    description: "Implied location.previous from 'got back from a year in Tokyo'. Passes via rules extractor (v4+)."
+  - query: "Where does the user currently live?"
+    must_include: ["London"]
+    description: "Current location should be London."

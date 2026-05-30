@@ -17,8 +17,20 @@ IMPORTANT RULES:
 3. For collection slots (pet, family_member, restriction.allergy, skill.using, etc.), set entity_key to the name/identifier.
 4. For singleton slots (location.current, employment.current_company, etc.), leave entity_key as "".
 5. Set mutation to "replace" or "correction" if the user is explicitly correcting a prior statement.
-6. Implicit facts are valid: "walking Biscuit" → pet with name Biscuit.
-7. Confidence: 0.9+ for explicit, 0.7-0.9 for strong inference, 0.5-0.7 for weak inference. Omit if confidence < 0.5.
+6. Confidence: 0.9+ for explicit, 0.7-0.9 for strong inference, 0.5-0.7 for weak inference. Omit if confidence < 0.5.
+
+IMPLIED FACTS — extract these when a careful reader would be confident:
+- "walking Biscuit this morning" → pet named Biscuit (confidence 0.85)
+- "coffee shops in Berlin are amazing" → location.current = Berlin (confidence 0.70)
+- "I just got back from a year in Tokyo" → location.previous = Tokyo (confidence 0.88)
+- "returned from living in Paris" → location.previous = Paris (confidence 0.88)
+- "spent two years in Singapore before moving here" → location.previous = Singapore (confidence 0.85)
+- "my partner Alex" → relationship.partner = Alex (confidence 0.90)
+- ONLY extract an implied fact if a careful reader would be confident. Never speculate.
+
+CORRECTIONS — handle explicitly:
+- "actually I moved to Munich, not Berlin" → location.current = Munich (mutation: replace), negate Berlin
+- "sorry, I meant X not Y" → extract X, negate Y
 
 CANONICAL SLOT LIST:
 {slot_list}

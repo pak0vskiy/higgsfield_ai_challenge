@@ -1,0 +1,26 @@
+user_id: u_henry
+description: "Opinion on remote work. Passes under semantic embeddings; BM25 confidence guard may drop it."
+turns:
+  - session_id: s1
+    timestamp: "2025-03-10T10:00:00Z"
+    messages:
+      - role: user
+        content: "I really enjoy working remotely. The flexibility is amazing."
+      - role: assistant
+        content: "Remote work definitely has its advantages."
+  - session_id: s1
+    timestamp: "2025-03-10T10:10:00Z"
+    messages:
+      - role: user
+        content: "I work as a software engineer at Acme Corp."
+      - role: assistant
+        content: "Great to know!"
+probes:
+  - query: "What does the user think about remote work?"
+    must_include: ["remote"]
+    description: >
+      Opinion query. 'think about remote work' → 'enjoy working remotely' / opinion.topic/remote-work.
+      May pass via BM25 if tokens overlap; stronger with semantic embeddings (v2+).
+  - query: "What is the user's job?"
+    must_include: ["engineer", "Acme"]
+    description: "Direct employment query — should always pass."

@@ -2,6 +2,11 @@
 Recall quality fixture test.
 Ingests scripted conversations, runs probe queries, reports recall@k.
 This is the iteration loop for CHANGELOG entries.
+
+Baseline by version:
+  v1 (rules-only, BM25): 6/11 probes passing (0.55)
+  v4 (rules + implied-facts, BM25 + fake-vec RRF): target ≥ 0.65 offline
+      Semantic probes (paraphrase, opinion) require OPENAI_API_KEY to pass.
 """
 import os
 import yaml
@@ -10,6 +15,8 @@ from pathlib import Path
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "conversations"
 pytestmark = pytest.mark.asyncio
+
+HAS_OPENAI_KEY = bool(os.environ.get("OPENAI_API_KEY"))
 
 
 def load_fixtures():
@@ -85,14 +92,70 @@ async def test_recall_quality(client):
     score = passed_probes / total_probes if total_probes else 0
     print(f"\n=== Recall Quality ===")
     print(f"recall_quality: {passed_probes}/{total_probes} probes passed ({score:.2f})")
+    print(f"Embeddings provider: {os.environ.get('EMBEDDINGS_PROVIDER', 'openai')}")
+    print(f"OpenAI key present: {HAS_OPENAI_KEY}")
     if failures:
         print("FAILURES:")
         for f in failures:
             print(f"  - {f}")
 
-    # We report but don't assert a minimum score — score evolves across CHANGELOG versions
-    # The important thing is the metric is printed and tracked
+    # We report but don't assert a minimum score — score evolves across CHANGELOG versions.
+    # Minimum bar: ≥ 65% of probes must pass offline (with fake embedder, rules extractor).
+    # Probes that require semantic embeddings are expected to fail offline.
     assert total_probes > 0, "No probes were run"
-    # Minimum bar: at least 50% of probes must pass in V1
-    assert passed_probes / total_probes >= 0.50, \
-        f"Recall quality too low: {passed_probes}/{total_probes}. Failures:\n" + "\n".join(failures)
+    assert passed_probes / total_probes >= 0.65, (
+        f"Recall quality too low: {passed_probes}/{total_probes} ({score:.2f}). "
+        f"Expected >= 0.65 offline.\nFailures:\n" + "\n".join(failures)
+    )
+
+
+@pytest.mark.skipif(not HAS_OPENAI_KEY, reason="OPENAI_API_KEY not set — skipping semantic recall test")
+async def test_semantic_recall_quality(client):
+    """
+    Full semantic recall test using real OpenAI embeddings.
+    Only runs when OPENAI_API_KEY is set (set EMBEDDINGS_PROVIDER=openai externally).
+    Expected score: ≥ 0.80 with semantic embeddings.
+    """
+    # Force real embeddings for this test
+    import os as _os
+    _os.environ["EMBEDDINGS_PROVIDER"] = "openai"
+
+    fixtures = load_fixtures()
+    total_probes = 0
+    passed_probes = 0
+    failures = []
+
+    for fname, fixture in fixtures:
+        user_id = fixture["user_id"] + "_semantic"  # separate namespace
+        # Re-ingest under a different user to avoid cross-test contamination
+        for turn in fixture["turns"]:
+            payload = {
+                "session_id": turn["session_id"] + "_sem",
+                "user_id": user_id,
+                "messages": turn["messages"],
+                "timestamp": turn["timestamp"],
+                "metadata": {},
+            }
+            r = await client.post("/turns", json=payload)
+            assert r.status_code == 201
+
+        for probe in fixture.get("probes", []):
+            total_probes += 1
+            passed, reason = await run_probe(client, user_id, probe)
+            if passed:
+                passed_probes += 1
+            else:
+                failures.append(f"{fname} | probe='{probe['query']}' | {reason}")
+
+    score = passed_probes / total_probes if total_probes else 0
+    print(f"\n=== Semantic Recall Quality ===")
+    print(f"recall_quality (semantic): {passed_probes}/{total_probes} probes passed ({score:.2f})")
+    if failures:
+        print("FAILURES:")
+        for f in failures:
+            print(f"  - {f}")
+
+    assert passed_probes / total_probes >= 0.80, (
+        f"Semantic recall too low: {passed_probes}/{total_probes} ({score:.2f}). "
+        f"Expected >= 0.80 with OpenAI embeddings.\nFailures:\n" + "\n".join(failures)
+    )

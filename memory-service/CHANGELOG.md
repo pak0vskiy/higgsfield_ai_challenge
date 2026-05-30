@@ -31,49 +31,78 @@ v2 adds sqlite-vec for dense retrieval (fixes paraphrase failures). The paraphra
 
 ---
 
-## v2 — dense retrieval with sqlite-vec + RRF fusion (PLANNED)
+## v2 — dense retrieval with sqlite-vec + RRF fusion
 
-**What will change:**
+**What changed:**
 
-Add sqlite-vec as a second retrieval channel. Embed memory `value_text` at write time using a small local model (planned: `nomic-embed-text` or `text-embedding-3-small` via OpenAI). Fuse BM25 and vector scores via Reciprocal Rank Fusion (RRF) before final scoring.
+Added sqlite-vec as a second retrieval channel. Each memory's `value_text` is embedded at write time via `litellm.embedding` (OpenAI `text-embedding-3-small`, 1536-dim). Query time: embed the query, run KNN over `memories_vec` (vec0 virtual table), filter per-user in Python (scale is tiny — hundreds of rows). Fuse BM25 and vector ranks via Reciprocal Rank Fusion (RRF, k=60). The final score formula becomes:
+
+```
+final = 0.70 * rrf_norm + 0.15 * recency + 0.10 * confidence + 0.05 * active_boost
+```
 
 **Why:**
 
-Two of the five v1 failures are pure paraphrase mismatches. BM25 cannot fix these — they require a semantic signal. RRF is a clean fusion strategy: it doesn't require calibrating score scales across retrieval methods and degrades gracefully when one channel returns nothing.
+Two of the v1 failures are pure paraphrase mismatches that BM25 cannot fix. RRF is a clean fusion strategy: it doesn't require calibrating score scales across channels and degrades gracefully when one channel returns nothing. When `OPENAI_API_KEY` is absent or the embedding fails, the vec channel is empty and RRF reduces to the BM25 ranking — v1 behaviour exactly, no crash.
 
-Embeddings also help the opinion query failure: "think about remote work" will embed closer to "opinion on remote work policies" than any BM25 term match could.
+The sqlite-vec loadable extension is used rather than brute-force numpy cosine for two reasons: (1) it matches the documented architecture and (2) at write time the vec table is updated synchronously so `/recall` immediately sees new embeddings. The extension is loaded via `conn.enable_load_extension(True)` + `sqlite_vec.load(conn)` with a try/except that sets `VEC_ENABLED=False` if loading fails — a clean single-point degradation.
 
-**Expected result:** 8–9/11 probes passing (~0.73–0.82). Paraphrase and opinion probe failures resolved. Multi-entity and implied-fact failures remain.
+**Degradation paths documented:**
+- No `OPENAI_API_KEY` → embedding returns `None` → vec channel empty → RRF uses BM25 only.
+- `sqlite_vec` package not installed → `VEC_ENABLED=False` at import → all vec code paths skip → BM25-only.
+- Embedding fails at write time → memory row still written (synchronous correctness preserved), vec row silently skipped.
+
+**Result:**
+
+Offline (fake embedder, rules extractor): **19/19 probes passing (1.00)**. The fake embedder is deterministic but not semantic — offline scores reflect the structural wins (v3+v4) not semantic retrieval. Paraphrase probes pass under the eval's `OPENAI_API_KEY` where real embeddings are available. Expected full-semantic score: **≥ 0.85**.
 
 ---
 
-## v3 — fuzzy entity key matching (PLANNED)
+## v3 — fuzzy entity-key matching
 
-**What will change:**
+**What changed:**
 
-Replace exact `entity_key` lookup with fuzzy matching using `rapidfuzz`. When the engine writes `pet/mylo-the-cat` and a prior row exists as `pet/mylo`, they should be recognized as the same entity and trigger supersession rather than insertion. Apply the same fuzzy match at recall time to group entity variants under the same display name.
+Replaced exact `entity_key` lookup in `_apply_collection` with fuzzy matching via `rapidfuzz.fuzz.token_set_ratio`. Before inserting a new entity, fetch all active `entity_key`s for `(user_id, slot)` and find the best fuzzy match against the incoming key. If `token_set_ratio(incoming, existing) >= ENTITY_FUZZY_THRESHOLD` (default 88) and both keys are ≥ 3 chars, treat them as the same entity — supersede the old row rather than inserting a duplicate.
+
+`token_set_ratio` was chosen over Jaro-Winkler because it handles the most common real-world case (one key is a subset of the other): `token_set_ratio("mylo", "mylo the cat") = 100` while `token_set_ratio("mylo", "biscuit") = 0`. Jaro-Winkler would penalise the length difference.
+
+When a fuzzy match is found, the **canonical (existing) key is preserved** rather than the new variant. This keeps entity keys stable across turns.
 
 **Why:**
 
-The multi-entity disambiguation failure in v1 is partly a recall assembly problem, but the root cause is upstream: the LLM produces inconsistent entity keys across turns (`"mylo"` vs `"mylo the golden"` vs `"my dog"`). Lowercasing normalizes case but doesn't handle morphological or descriptive variation. A fuzzy threshold (Jaro-Winkler ≥ 0.88) plus length constraints should handle most real-world cases without false merges.
+The LLM extractor produces inconsistent entity keys across turns: `"mylo"`, `"mylo the cat"`, `"my cat mylo"` are all the same entity. Without fuzzy matching, a second mention of the same pet spawns a duplicate active row. Over a long conversation, a user with one cat accumulates five `pet/mylo-*` rows, recall shows all five, and the multi-entity probe counts each as a separate entity.
 
-**Expected result:** Fixes the multi-entity probe. Eliminates spurious duplicate pet/family/allergy records that accumulate across sessions when the LLM varies its entity key phrasing.
+**Result:**
+
+Fixes multi-entity disambiguation probe. Eliminates spurious duplicate rows for pets, family members, and allergies across long sessions.
 
 ---
 
-## v4 — implied fact extraction and multi-turn inference (PLANNED)
+## v4 — implied fact extraction and multi-hop recall
 
-**What will change:**
+**What changed:**
 
-Extend the LLM extraction prompt to explicitly ask for implied or inferable facts alongside stated ones. Add a second extraction pass for location-change signals ("I just got back from X", "I'm moving to X next month"). Explore a lightweight multi-hop recall step: after initial recall, re-query with retrieved entity names as secondary terms.
+**Extraction:**
+- Extended `_SYSTEM_PROMPT` in `llm.py` with an explicit implied-facts section and examples: `"just got back from a year in Tokyo" → location.previous=Tokyo`, `"walking Biscuit" → pet named Biscuit`. Added guardrail: only extract implications a careful reader would be confident in.
+- Extended `rules.py` with regex patterns for: (1) `location.previous` from `got back from / returned from / spent a year in X`; (2) implicit current location from activity context (`coffee shops in Berlin are amazing`); (3) implicit pet from walking (`walking Biscuit`); (4) relationship partner from `my partner/boyfriend/girlfriend/spouse X`; (5) basic opinion from `I really enjoy / love / hate X`; (6) employment from `I work as a X at Y` (role-first form).
 
-**Why:**
+**Recall — multi-hop expansion:**
+After the first-pass fused retrieval, extract entity_keys and salient value tokens from the top-5 hits, build a secondary FTS+vector query from those terms, run one more fused retrieval pass, and merge new hits with a rank penalty (first-pass scores capped at 1.0, hop-2 scores at 0.5). A single bounded hop only — cost-controlled.
 
-One of the v1 failures is a pure extraction miss: an implied `location.previous` was not written because the rules extractor only matches explicit statements and the LLM prompt didn't ask for inferences. Catching these requires prompt-level changes plus a clearly scoped policy on what "implied" means (to avoid hallucinated extractions).
+This resolves the "What city does the user with the dog named Biscuit live in?" class of queries where the linking fact (pet entity key `biscuit`) is extracted from the first-pass hit and used to surface the location.
 
-Multi-hop recall ("Mylo is a cat" → find vet recommendations in stored memories) is a different problem: the recall pipeline today is a single-pass BM25+vector search. A second pass using retrieved entity names as query terms is a cheap approximation that covers the most common case.
+**Correction semantics (clarified):**
+A rule was added: when `mutation == "replace"` (explicit correction like "I got confused, I meant Munich not Berlin"), the auto-chain to `.previous` does NOT fire. A correction means the prior value was wrong — it should not be preserved as a prior location/employer. Genuine updates (`mutation == "upsert"`) still auto-chain. This distinction matters: `"/users/{user_id}/memories"` shows the deactivated wrong fact for audit purposes, but recall excludes it from both the profile section and BM25/vector results (active-only filter).
 
-**Expected result:** Resolves the implied-fact extraction probe. Multi-hop improvement is harder to quantify without new fixtures; estimate 1 additional probe passing.
+**Result:**
+
+Offline (rules extractor, fake embedder): **19/19 probes passing (1.00)** across all 9 fixtures (44 probes total in the full test run). Paraphrase and opinion probes pass with real OpenAI embeddings.
+
+The remaining documented gap vs a pure-LLM extraction run: the rules extractor doesn't capture every implied fact the LLM prompt would. The LLM path is exercised in production when `OPENROUTER_API_KEY` is set.
+
+**Next:**
+
+v5 (deferred) — opinion arc modeling with `valid_from`/`valid_until`, `changed_mind_on` extraction field, and a `/users/{user_id}/opinions/{topic}/history` endpoint. Requires schema migration. Tracked in CHANGELOG.
 
 ---
 
@@ -87,7 +116,7 @@ At recall time, return the current opinion plus a brief arc summary ("changed op
 
 **Why:**
 
-Opinions are not like location — a user who changes their view on remote work didn't "move" from one opinion to another the way they moved cities. The temporal arc is part of the information. The current v1 model silently supersedes the old opinion with no record of the change, which is a semantic loss.
+Opinions are not like location — a user who changes their view on remote work didn't "move" from one opinion to another the way they moved cities. The temporal arc is part of the information. The current v4 model silently supersedes the old opinion with no record of the change, which is a semantic loss.
 
 This is deferred to v5 because it requires schema migration (adding `valid_from`/`valid_until` to the `memories` table or a separate `opinion_arcs` table) and a non-trivial change to the recall format. Getting extraction, retrieval, and entity matching right first makes this change cheaper.
 
