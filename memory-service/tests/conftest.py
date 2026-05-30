@@ -3,13 +3,15 @@ import importlib
 import pytest
 import asyncio
 
-# Use rules extractor (no LLM key needed in tests)
-os.environ["MEMORY_EXTRACTOR"] = "rules"
+# Use rules extractor by default (no LLM key needed).
+# Override by setting MEMORY_EXTRACTOR=llm in your environment.
+os.environ.setdefault("MEMORY_EXTRACTOR", "rules")
 
-# Use fake (deterministic) embedder with a small dimension so vec0 wiring
-# is fully exercised in tests without any API key.
-os.environ["EMBEDDINGS_PROVIDER"] = "fake"
-os.environ["EMBEDDING_DIM"] = "64"
+# Use fake (deterministic) embedder with a small dimension by default so
+# vec0 wiring is exercised without any API key.
+# Override by setting EMBEDDINGS_PROVIDER=openai (requires OPENAI_API_KEY).
+os.environ.setdefault("EMBEDDINGS_PROVIDER", "fake")
+os.environ.setdefault("EMBEDDING_DIM", "64")
 
 
 @pytest.fixture(scope="function")

@@ -2,6 +2,9 @@ import json, uuid, logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
+load_dotenv()  # load .env before any os.getenv() calls
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
