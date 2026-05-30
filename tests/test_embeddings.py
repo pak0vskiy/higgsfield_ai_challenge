@@ -8,8 +8,10 @@ import pytest
 import importlib
 
 
-def _get_embeddings_module():
-    """Reload embeddings module to pick up current env vars."""
+def _get_embeddings_module(provider: str = "fake"):
+    """Reload embeddings module with the given provider. Defaults to 'fake'."""
+    os.environ["EMBEDDINGS_PROVIDER"] = provider
+    os.environ.setdefault("EMBEDDING_DIM", "64")
     import memory_service.embeddings as m
     importlib.reload(m)
     return m
