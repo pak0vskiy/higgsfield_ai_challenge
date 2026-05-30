@@ -1,5 +1,6 @@
 import os
-from fastapi import Request, HTTPException, status
+from fastapi import Request
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 
@@ -18,9 +19,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
+            return JSONResponse(status_code=401, content={"detail": "Missing bearer token"})
         token = auth_header[len("Bearer "):]
         if token != required_token:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid token")
+            return JSONResponse(status_code=403, content={"detail": "Invalid token"})
 
         return await call_next(request)
