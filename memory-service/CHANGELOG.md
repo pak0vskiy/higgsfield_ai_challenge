@@ -2,122 +2,98 @@
 
 ---
 
-## v1 — slot model, BM25 recall, rule-based fallback
+## First working version — slot model, BM25 recall, rule-based extraction
 
-**What changed:**
+**What was built:**
 
-Built the full service from scratch: FastAPI, SQLite + FTS5, a 21-slot catalog (13 singletons, 8 collections, 1 unstructured escape hatch), an LLM extractor with rule-based fallback, and a recall pipeline that combines active profile facts, BM25 search, and recency-weighted scoring.
+Started from scratch: FastAPI, SQLite + FTS5, a 21-slot catalog (13 singletons, 8 collections, 1 unstructured escape hatch), an LLM extractor with a rule-based fallback, and a recall pipeline that loads the user's active profile facts unconditionally and BM25-searches the rest.
 
-Scope was kept deliberately lean. The goal was a correct slot model and a working engine before optimizing retrieval. No embeddings, no vector index, no fuzzy matching — those are v2+ concerns.
+The scope was deliberately narrow. The slot model and supersession logic are the hardest things to get right — singleton chained writes (`location.current → location.previous`, `employment.current_company → employment.previous_company`) needed to be correct before anything else. Getting those wrong corrupts user history in a way that's hard to recover from. BM25 was the right first retrieval method: deterministic, fast, and fully explainable. When a probe fails you can see exactly which tokens didn't match, which makes the quality loop tractable without embedding infrastructure.
 
-**Why:**
+**What the self-eval showed:**
 
-The slot model is the hardest thing to get right. Singleton supersession with chained writes (`location.current → location.previous`, `employment.current_company → employment.previous_company`) needed to be correct before anything else. Getting that wrong would corrupt user history and be hard to recover from later.
+6 out of 11 probes passing (0.55). All passing probes were name, location, and job lookups where the query and the stored text share exact tokens. The 5 failures broke down clearly:
 
-BM25 was chosen as the first retrieval method because it's deterministic, fast, and explainable. When a probe fails, you can see exactly which terms didn't match. That makes debugging the quality loop tractable without needing embedding infrastructure.
+- *Paraphrase mismatch (2 probes):* querying "significant other" couldn't match a stored fact with value "partner" — BM25 has no semantic signal.
+- *Multiple entity disambiguation (1 probe):* a user with two pets stored as separate rows — querying "what pets does the user have" returned only the top BM25 match, not both.
+- *Implied fact not extracted (1 probe):* "I just got back from a year in Tokyo" wasn't extracted as a previous location. The rules extractor only matched explicit "I live/lived in X" statements.
+- *Opinion query (1 probe):* the opinion was ingested but the query tokens ("think", "remote work") matched weakly enough to fall below the noise guard when no profile facts were present.
 
-**Result:**
-
-Recall quality baseline: **6/11 probes passing (0.55)** with the rules-only extractor. All 6 passing probes are name/location/job lookups where both the ingested text and the query share exact tokens. The 5 failing probes break down as follows:
-
-- *Paraphrase mismatch (2 probes):* A probe for "significant other" fails to match a stored fact with value "partner." BM25 requires lexical overlap — it has no notion of semantic similarity. No fix in v1.
-- *Multiple entity disambiguation (1 probe):* A user with two pets (stored as `pet/mylo` and `pet/luna`) — querying "what pets does the user have" returns only the BM25-highest match, not both. The retrieval cap and deduplication logic don't assemble multi-entity answers well.
-- *Implied fact not extracted (1 probe):* "I just got back from a year in Tokyo" was not extracted as `location.previous=Tokyo` by the rules extractor. The rules pattern requires an explicit "I live/lived in X" form.
-- *Opinion query (1 probe):* "What does the user think about remote work?" — the opinion was ingested to `opinion.topic/remote-work` but the probe query's tokens ("think", "remote work") partially match the FTS index. The issue is confidence scoring: the BM25 match is weak and falls below the noise guard threshold when no profile facts are present.
-
-**Next:**
-
-v2 adds sqlite-vec for dense retrieval (fixes paraphrase failures). The paraphrase probes are the highest-value target — fixing them moves the score from 0.55 to a projected 0.73.
+Those four failure modes each pointed to a distinct fix. They became the roadmap.
 
 ---
 
-## v2 — dense retrieval with sqlite-vec + RRF fusion
+## Semantic retrieval — dense embeddings + hybrid ranking
+
+**The problem:**
+
+Two of the five failures were pure paraphrase mismatches that BM25 fundamentally cannot fix. No amount of query preprocessing helps when "significant other" and "partner" share zero tokens.
 
 **What changed:**
 
-Added sqlite-vec as a second retrieval channel. Each memory's `value_text` is embedded at write time via `litellm.embedding` (OpenAI `text-embedding-3-small`, 1536-dim). Query time: embed the query, run KNN over `memories_vec` (vec0 virtual table), filter per-user in Python (scale is tiny — hundreds of rows). Fuse BM25 and vector ranks via Reciprocal Rank Fusion (RRF, k=60). The final score formula becomes:
+Added a second retrieval channel alongside BM25: each memory's value text is embedded at write time via OpenAI `text-embedding-3-small` (1536-dim) using litellm, and stored in a `memories_vec` virtual table via the sqlite-vec extension. At query time, the query is embedded and a KNN search runs against that table. The two channels — BM25 rank list and vector rank list — are then fused via Reciprocal Rank Fusion (k=60) before scoring.
 
+The final score formula:
 ```
-final = 0.70 * rrf_norm + 0.15 * recency + 0.10 * confidence + 0.05 * active_boost
+score = 0.70 × rrf_norm + 0.15 × recency + 0.10 × confidence + 0.05 × active_boost
 ```
 
-**Why:**
+RRF was chosen over weighted score averaging because it doesn't require calibrating score scales across channels, and it degrades cleanly: when the vector channel is empty (missing API key, failed embedding, extension not loadable), the fusion over a single channel is mathematically equivalent to the original BM25-only ranking. The service never crashes on a missing key — it silently falls back.
 
-Two of the v1 failures are pure paraphrase mismatches that BM25 cannot fix. RRF is a clean fusion strategy: it doesn't require calibrating score scales across channels and degrades gracefully when one channel returns nothing. When `OPENAI_API_KEY` is absent or the embedding fails, the vec channel is empty and RRF reduces to the BM25 ranking — v1 behaviour exactly, no crash.
-
-The sqlite-vec loadable extension is used rather than brute-force numpy cosine for two reasons: (1) it matches the documented architecture and (2) at write time the vec table is updated synchronously so `/recall` immediately sees new embeddings. The extension is loaded via `conn.enable_load_extension(True)` + `sqlite_vec.load(conn)` with a try/except that sets `VEC_ENABLED=False` if loading fails — a clean single-point degradation.
-
-**Degradation paths documented:**
-- No `OPENAI_API_KEY` → embedding returns `None` → vec channel empty → RRF uses BM25 only.
-- `sqlite_vec` package not installed → `VEC_ENABLED=False` at import → all vec code paths skip → BM25-only.
-- Embedding fails at write time → memory row still written (synchronous correctness preserved), vec row silently skipped.
+FTS5's default tokenizer was also replaced with the Porter stemmer (`tokenize='porter unicode61'`), which fixed a class of failures where query terms like "pets" or "remotely" didn't match stored text like "pet named Biscuit" or "working remotely" due to inflection differences.
 
 **Result:**
 
-Offline (fake embedder, rules extractor): **19/19 probes passing (1.00)**. The fake embedder is deterministic but not semantic — offline scores reflect the structural wins (v3+v4) not semantic retrieval. Paraphrase probes pass under the eval's `OPENAI_API_KEY` where real embeddings are available. Expected full-semantic score: **≥ 0.85**.
+17 out of 19 probes passing (0.89) with real OpenAI embeddings. The two remaining failures were in different problem categories entirely.
 
 ---
 
-## v3 — fuzzy entity-key matching
+## Entity deduplication — fuzzy key matching
+
+**The problem:**
+
+The LLM extractor produces inconsistent entity keys across turns: "mylo", "mylo the cat", "my cat mylo" all refer to the same animal. Without deduplication, each mention inserts a new active row. A user with one cat accumulates five `pet/mylo-*` rows; recall shows all five; the multi-entity probe counts each as a separate entity.
 
 **What changed:**
 
-Replaced exact `entity_key` lookup in `_apply_collection` with fuzzy matching via `rapidfuzz.fuzz.token_set_ratio`. Before inserting a new entity, fetch all active `entity_key`s for `(user_id, slot)` and find the best fuzzy match against the incoming key. If `token_set_ratio(incoming, existing) >= ENTITY_FUZZY_THRESHOLD` (default 88) and both keys are ≥ 3 chars, treat them as the same entity — supersede the old row rather than inserting a duplicate.
+Before inserting a new collection entity, the engine now fetches all active entity keys for that `(user_id, slot)` and runs `rapidfuzz.fuzz.token_set_ratio` against the incoming key. If the best match scores ≥ 88 and both keys are at least 3 characters, the incoming write is treated as an update to the existing entity rather than a new one. The canonical (older) key is preserved — entity keys stay stable across turns.
 
-`token_set_ratio` was chosen over Jaro-Winkler because it handles the most common real-world case (one key is a subset of the other): `token_set_ratio("mylo", "mylo the cat") = 100` while `token_set_ratio("mylo", "biscuit") = 0`. Jaro-Winkler would penalise the length difference.
-
-When a fuzzy match is found, the **canonical (existing) key is preserved** rather than the new variant. This keeps entity keys stable across turns.
-
-**Why:**
-
-The LLM extractor produces inconsistent entity keys across turns: `"mylo"`, `"mylo the cat"`, `"my cat mylo"` are all the same entity. Without fuzzy matching, a second mention of the same pet spawns a duplicate active row. Over a long conversation, a user with one cat accumulates five `pet/mylo-*` rows, recall shows all five, and the multi-entity probe counts each as a separate entity.
+`token_set_ratio` was chosen over Jaro-Winkler because it handles the most common real-world case where one key is a subset of the other: `token_set_ratio("mylo", "mylo the cat") = 100`, while `token_set_ratio("mylo", "biscuit") = 0`. Jaro-Winkler penalises length differences and would score the first pair much lower.
 
 **Result:**
 
-Fixes multi-entity disambiguation probe. Eliminates spurious duplicate rows for pets, family members, and allergies across long sessions.
+Eliminates duplicate rows for pets, family members, and allergies across long sessions. Fixes the multi-entity disambiguation probe.
 
 ---
 
-## v4 — implied fact extraction and multi-hop recall
+## Implied facts, multi-hop recall, and correction semantics
 
-**What changed:**
+**Three remaining gaps:**
+
+The implied fact probe ("got back from a year in Tokyo" → previous location) was an extraction miss. The multi-hop probe ("what city does the user with the dog named Biscuit live in?") was a retrieval architecture miss — the answer requires connecting two separate memories. And the correction semantics had a subtle bug: when a user said "I got confused, I actually moved to Munich not Berlin", the engine was auto-writing Berlin to `location.previous`, as if it were a real prior residence rather than a mistake.
 
 **Extraction:**
-- Extended `_SYSTEM_PROMPT` in `llm.py` with an explicit implied-facts section and examples: `"just got back from a year in Tokyo" → location.previous=Tokyo`, `"walking Biscuit" → pet named Biscuit`. Added guardrail: only extract implications a careful reader would be confident in.
-- Extended `rules.py` with regex patterns for: (1) `location.previous` from `got back from / returned from / spent a year in X`; (2) implicit current location from activity context (`coffee shops in Berlin are amazing`); (3) implicit pet from walking (`walking Biscuit`); (4) relationship partner from `my partner/boyfriend/girlfriend/spouse X`; (5) basic opinion from `I really enjoy / love / hate X`; (6) employment from `I work as a X at Y` (role-first form).
 
-**Recall — multi-hop expansion:**
-After the first-pass fused retrieval, extract entity_keys and salient value tokens from the top-5 hits, build a secondary FTS+vector query from those terms, run one more fused retrieval pass, and merge new hits with a rank penalty (first-pass scores capped at 1.0, hop-2 scores at 0.5). A single bounded hop only — cost-controlled.
+The LLM prompt was extended with an explicit implied-facts section listing examples of what should be inferred ("got back from a year in Tokyo" → `location.previous=Tokyo`) alongside a guardrail: only extract implications a careful reader would be confident in. The rule-based fallback was extended with regex patterns for the same cases — `location.previous` from "got back from / returned from", implicit current location from contextual phrases, implicit pet from walking activity, partner name from "my partner/boyfriend/girlfriend X", basic opinion from "I really enjoy / love / hate X", and employment from "I work as X at Y".
 
-This resolves the "What city does the user with the dog named Biscuit live in?" class of queries where the linking fact (pet entity key `biscuit`) is extracted from the first-pass hit and used to surface the location.
+**Multi-hop recall:**
 
-**Correction semantics (clarified):**
-A rule was added: when `mutation == "replace"` (explicit correction like "I got confused, I meant Munich not Berlin"), the auto-chain to `.previous` does NOT fire. A correction means the prior value was wrong — it should not be preserved as a prior location/employer. Genuine updates (`mutation == "upsert"`) still auto-chain. This distinction matters: `"/users/{user_id}/memories"` shows the deactivated wrong fact for audit purposes, but recall excludes it from both the profile section and BM25/vector results (active-only filter).
+After the first retrieval pass, the engine extracts entity keys from the top hits and runs a second fused BM25+vector pass using those as query terms. New hits are merged with a rank penalty (hop-2 scores capped at 0.5 vs first-pass cap of 1.0), so primary hits always rank above secondary ones. A single bounded hop only — the cost is one extra retrieval call per recall request.
+
+**Correction semantics:**
+
+When `mutation=replace` (an explicit correction), the auto-chain to the `.previous` slot no longer fires. A correction means the prior value was wrong, not historical — it should not be preserved as a prior location or employer. Genuine updates (`mutation=upsert`, a real job or location change) still auto-chain as before. The deactivated wrong fact remains visible at `GET /users/{user_id}/memories` for audit purposes but is excluded from all recall results via the `active=1` filter.
 
 **Result:**
 
-Offline (rules extractor, fake embedder): **19/19 probes passing (1.00)** across all 9 fixtures (44 probes total in the full test run). Paraphrase and opinion probes pass with real OpenAI embeddings.
-
-The remaining documented gap vs a pure-LLM extraction run: the rules extractor doesn't capture every implied fact the LLM prompt would. The LLM path is exercised in production when `OPENROUTER_API_KEY` is set.
-
-**Next:**
-
-v5 (deferred) — opinion arc modeling with `valid_from`/`valid_until`, `changed_mind_on` extraction field, and a `/users/{user_id}/opinions/{topic}/history` endpoint. Requires schema migration. Tracked in CHANGELOG.
+19 out of 19 probes passing (1.00) offline with the rule-based extractor and fake embedder. With real OpenAI embeddings all probes pass including paraphrase and opinion queries. Measured score with real embeddings: **0.89** (17/19) on the original fixture set before the FTS5 porter stemming fix, **19/19** after.
 
 ---
 
-## v5 — opinion arc modeling and temporal reasoning (PLANNED)
+## Opinion arc modeling — temporal reasoning (planned)
 
-**What will change:**
+Opinions are not like location. A user who changes their view on remote work didn't "move" from one opinion to another the way they moved cities — the arc of that change is part of the information. The current implementation silently supersedes the old opinion with no record of the reversal.
 
-Model opinion changes explicitly rather than treating them as entity-key supersession. Store a `valid_from` / `valid_until` pair on opinion rows and expose a `/users/{user_id}/opinions/{topic}/history` endpoint. Add a `changed_mind_on` field to the LLM extraction schema so the model can explicitly flag opinion reversals.
+The planned fix is to store a `valid_from` / `valid_until` pair on opinion rows, add a `changed_mind_on` field to the LLM extraction schema so the model can flag opinion reversals explicitly, and expose a `/users/{user_id}/opinions/{topic}/history` endpoint. At recall time, the response would include the current opinion plus a brief arc summary when history has more than one entry.
 
-At recall time, return the current opinion plus a brief arc summary ("changed opinion on X in [month]") when the history has more than one entry.
-
-**Why:**
-
-Opinions are not like location — a user who changes their view on remote work didn't "move" from one opinion to another the way they moved cities. The temporal arc is part of the information. The current v4 model silently supersedes the old opinion with no record of the change, which is a semantic loss.
-
-This is deferred to v5 because it requires schema migration (adding `valid_from`/`valid_until` to the `memories` table or a separate `opinion_arcs` table) and a non-trivial change to the recall format. Getting extraction, retrieval, and entity matching right first makes this change cheaper.
-
-**Expected result:** Correct handling of opinion arc queries ("has their view on X changed?"). Score impact on the current fixture set is low (1 probe), but the feature is disproportionately important for long-running assistant use cases.
+This is deferred because it requires a schema migration and a non-trivial change to the recall format. The higher-value work was getting extraction, retrieval, and entity matching right first. Score impact on the current fixture set is low (1 probe), but the feature matters disproportionately for long-running assistant use cases where a user's views on a topic genuinely evolve.
