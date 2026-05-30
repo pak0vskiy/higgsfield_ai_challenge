@@ -13,7 +13,7 @@ import yaml
 import pytest
 from pathlib import Path
 
-FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "conversations"
+FIXTURES_DIR = Path(__file__).parent / "fixtures" / "conversations"
 pytestmark = pytest.mark.asyncio
 
 HAS_OPENAI_KEY = bool(os.environ.get("OPENAI_API_KEY"))
