@@ -1,9 +1,7 @@
 import os
 from fastapi import Request, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.base import BaseHTTPMiddleware
 
-_REQUIRED_TOKEN = os.getenv("MEMORY_AUTH_TOKEN", "").strip()
 
 class AuthMiddleware(BaseHTTPMiddleware):
     """Optional bearer token auth. Skipped if MEMORY_AUTH_TOKEN is not set."""
@@ -11,7 +9,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
     EXEMPT_PATHS = {"/health"}
 
     async def dispatch(self, request: Request, call_next):
-        if not _REQUIRED_TOKEN:
+        # Read token at request time so tests can set/unset the env var dynamically.
+        required_token = os.getenv("MEMORY_AUTH_TOKEN", "").strip()
+        if not required_token:
             return await call_next(request)
         if request.url.path in self.EXEMPT_PATHS:
             return await call_next(request)
@@ -20,7 +20,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if not auth_header.startswith("Bearer "):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
         token = auth_header[len("Bearer "):]
-        if token != _REQUIRED_TOKEN:
+        if token != required_token:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid token")
 
         return await call_next(request)
