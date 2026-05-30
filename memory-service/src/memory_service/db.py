@@ -118,7 +118,8 @@ def init_db():
                 evidence,
                 slot,
                 content='memories',
-                content_rowid='rowid'
+                content_rowid='rowid',
+                tokenize='porter unicode61'
             );
 
             -- FTS5 sync triggers

@@ -16,7 +16,11 @@ os.environ.setdefault("MEMORY_EXTRACTOR", "rules")
 # vec0 wiring is exercised without any API key.
 # Override by setting EMBEDDINGS_PROVIDER=openai (requires OPENAI_API_KEY).
 os.environ.setdefault("EMBEDDINGS_PROVIDER", "fake")
-os.environ.setdefault("EMBEDDING_DIM", "64")
+# Only use tiny dimension for the fake provider — real providers return their own fixed dimension
+# (e.g. text-embedding-3-small = 1536). Setting 64 here when provider=openai would cause every
+# vector insert to silently fail due to dimension mismatch against the vec0 table.
+if os.environ["EMBEDDINGS_PROVIDER"] == "fake":
+    os.environ.setdefault("EMBEDDING_DIM", "64")
 
 
 @pytest.fixture(scope="function")
