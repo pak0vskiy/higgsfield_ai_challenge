@@ -106,6 +106,16 @@ A noise guard returns empty context when there are no profile facts AND the top 
 
 ---
 
+## Session vs. User Deletion Semantics
+
+`DELETE /sessions/{session_id}` removes raw turn records for that session but **does not delete extracted memories**, even those whose `source_session_id` matches. This is an intentional design decision: memories are user-scoped, not session-scoped. A fact the user stated in session 1 ("I live in Berlin") is still true in session 3 — deleting the session should not erase the user's profile.
+
+`DELETE /users/{user_id}` is the full-cleanup endpoint: it removes both turns and all memories for that user.
+
+**Implication for eval harness:** if the harness calls `DELETE /sessions/{session_id}` between scenarios expecting a blank slate, memories written during that session will persist and could influence subsequent `/recall` calls for the same `user_id`. The harness should call `DELETE /users/{user_id}` for complete isolation between scenarios. Cross-session memory retention is a documented feature, not a bug — but it means the two delete endpoints have asymmetric semantics.
+
+---
+
 ## Fact Evolution
 
 **Singleton supersession** (Tier 1): writing a new value deactivates the prior row (`active=0`, `supersedes=<old_id>`). For update mutations, the prior value is auto-written to the `.previous` sibling slot (`location.current → location.previous`, `employment.current_company → employment.previous_company`). For correction mutations (`mutation=replace`), the auto-chain does not fire — the prior value was incorrect, not historical.
