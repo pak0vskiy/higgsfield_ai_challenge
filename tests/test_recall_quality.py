@@ -13,7 +13,7 @@ import yaml
 import pytest
 from pathlib import Path
 
-FIXTURES_DIR = Path(__file__).parent / "fixtures" / "conversations"
+FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "conversations"
 pytestmark = pytest.mark.asyncio
 
 HAS_OPENAI_KEY = bool(os.environ.get("OPENAI_API_KEY"))
@@ -155,6 +155,7 @@ async def test_semantic_recall_quality(client):
         for f in failures:
             print(f"  - {f}")
 
+    assert total_probes > 0, "No probes were run — check FIXTURES_DIR path"
     assert passed_probes / total_probes >= 0.80, (
         f"Semantic recall too low: {passed_probes}/{total_probes} ({score:.2f}). "
         f"Expected >= 0.80 with OpenAI embeddings.\nFailures:\n" + "\n".join(failures)

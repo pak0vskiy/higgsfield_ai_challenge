@@ -43,9 +43,9 @@ def _fake_embed(text: str) -> list[float]:
     seed = int.from_bytes(seed_bytes[:8], "big")
     rng = np.random.default_rng(seed)
     vec = rng.standard_normal(dim).astype(np.float32)
-    norm = np.linalg.norm(vec)
-    if norm > 0:
-        vec = vec / norm
+    # Skip BLAS-based normalization — np.linalg.norm on float32 can give
+    # non-identical results across calls on some CPUs due to SIMD reordering.
+    # For test purposes (determinism + distinctness) a raw seeded vector is fine.
     return vec.tolist()
 
 
